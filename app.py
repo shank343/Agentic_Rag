@@ -2,6 +2,7 @@ import streamlit as st
 import tempfile
 import os
 import time
+import gc
 from dotenv import load_dotenv
 from langsmith import traceable, Client
 from langsmith.run_helpers import get_current_run_tree
@@ -16,6 +17,12 @@ def clean_metadata(docs):
 
 load_dotenv()
 client = Client()
+
+# ── Chroma persist directory ─────────────────────────────────────
+import uuid
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
+CHROMA_DIR = f"/tmp/chroma_{st.session_state.session_id}"
 
 st.set_page_config(
     page_title="Agentic RAG App",
@@ -64,7 +71,7 @@ div[data-testid="InputInstructions"] { display: none; }
 
 # ── Header ──────────────────────────────────────────────────────
 st.markdown("## 📚 Agentic RAG Application")
-st.caption("Retrieval Augmented Generation · HuggingFace Embeddings · Chroma · LangGraph")
+st.caption("Retrieval Augmented Generation · Google Embeddings · Chroma · LangGraph")
 
 # ── Traceable invoke ─────────────────────────────────────────────
 @traceable(name="rag-pipeline-run")
@@ -86,30 +93,53 @@ def traced_invoke(query, retriever):
         "web_search": False,
         "documents": [],
         "generation": "",
-    }, config={"recursion_limit": 15}))
+    }, config={"recursion_limit": 10}))
 
     return stream_outputs, sim_results, run_id
+
+# ── Get embeddings (API-based, no RAM footprint) ──────────────────
+def get_embeddings():
+    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    return GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        request_options={"timeout": 120}
+    )
+
+# ── Get or load vectorstore from disk ────────────────────────────
+def load_vectorstore_from_disk():
+    from langchain_chroma import Chroma
+    if os.path.exists(CHROMA_DIR):
+        embeddings = get_embeddings()
+        return Chroma(
+            collection_name="rag-session",
+            persist_directory=CHROMA_DIR,
+            embedding_function=embeddings
+        )
+    return None
 
 # ── Session state init ──────────────────────────────────────────
 if "urls" not in st.session_state:
     st.session_state.urls = [
-        "https://lilianweng.github.io/posts/2023-06-23-agent/",
-        "https://lilianweng.github.io/posts/2023-03-15-prompt-engineering/",
-        "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/",
+        "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/"
     ]
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
 if "ingested" not in st.session_state:
     st.session_state.ingested = False
+    # Try to load existing vectorstore from disk on startup
+    vs = load_vectorstore_from_disk()
+    if vs:
+        st.session_state.retriever = vs.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 3, "fetch_k": 10}
+        )
+        st.session_state.ingested = True
 if "append_mode" not in st.session_state:
     st.session_state.append_mode = False
 if "url_input_key" not in st.session_state:
     st.session_state.url_input_key = 0
 if "uploaded_files_count" not in st.session_state:
     st.session_state.uploaded_files_count = 0
-
 
 # ── Tabs ────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["ABOUT", "INGEST", "QUERY"])
@@ -120,7 +150,6 @@ tab1, tab2, tab3 = st.tabs(["ABOUT", "INGEST", "QUERY"])
 # ════════════════════════════════════════════════════════════════
 with tab1:
 
-    # ── Author card ──────────────────────────────────────────────
     st.markdown("""
     <div style="display:flex; align-items:center; gap:1.5rem; padding:1.25rem 1.5rem;
                 background:#f8f9ff; border:1px solid #e0e0f0; border-radius:10px;
@@ -138,11 +167,9 @@ with tab1:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Heading ──────────────────────────────────────────────────
     st.markdown("### Agentic RAG System")
     st.markdown("---")
 
-    # ── Project description ───────────────────────────────────────
     st.markdown("""
     This project implements an **Adaptive Retrieval-Augmented Generation (RAG)** pipeline
     built on **LangGraph** — a framework for building stateful, graph-based AI workflows.
@@ -167,8 +194,8 @@ with tab1:
 
         **🟣 Retrieve**
         Fetches the most semantically relevant document chunks from the Chroma vectorstore
-        using HuggingFace's `all-MiniLM-L6-v2` embedding model. Returns the top matching
-        chunks for the grader to evaluate.
+        using Google's embedding model. Returns the top matching chunks for the grader
+        to evaluate.
 
         ---
 
@@ -196,10 +223,12 @@ with tab1:
 
     st.markdown("""
     ---
-    The pipeline runs on **Groq's inference API** — `llama-3.1-8b-instant` for document relevance grading + answer generation and `llama-3.3-70b-versatile` for quality checks — alongside **Tavily** for live web search and **HuggingFace** embeddings for semantic similarity. Every run is traced end-to-end with **LangSmith**.
+    The pipeline runs on **Groq's inference API** — `llama-3.1-8b-instant` for document
+    relevance grading + answer generation and `llama-3.3-70b-versatile` for quality checks —
+    alongside **Tavily** for live web search and **Google Generative AI** embeddings for
+    semantic similarity. Every run is traced end-to-end with **LangSmith**.
     """)
 
-    # ── Process Flow ─────────────────────────────────────────────
     st.markdown("### Process Flow")
     st.image("static/Langgraph Adaptive Rag.png", use_container_width=True)
 
@@ -218,7 +247,7 @@ with tab2:
         st.info("➕ **Append mode** — Add new sources below and click INGEST to add them to the existing knowledge base. Previously ingested documents are safe and will not be re-added.")
     else:
         st.caption("Add URLs and/or upload local files, then click Ingest to build the knowledge base.")
-        st.caption("_A few links have been selected for you. You can remove them and add your own._")
+        st.caption("_A link has been selected for you. You can remove it and add your own._")
 
     st.markdown("---")
 
@@ -284,7 +313,7 @@ with tab2:
 
     st.markdown("---")
 
-    # ── Ingest Button — enabled if URLs OR files present ──────────
+    # ── Ingest Button ─────────────────────────────────────────────
     has_sources = (
         len(st.session_state.urls) > 0 or
         (uploaded_files is not None and len(uploaded_files) > 0) or
@@ -296,6 +325,7 @@ with tab2:
         disabled=already_ingested or not has_sources,
         type="primary"
     )
+
     log_placeholder = st.empty()
     if already_ingested:
         st.caption("⚠️ Knowledge base already exists. Use **Add More Documents** below to append.")
@@ -328,98 +358,155 @@ with tab2:
             render_log(logs)
 
         try:
-            from langchain_community.document_loaders import WebBaseLoader
             from langchain_text_splitters import RecursiveCharacterTextSplitter
-            from langchain_community.embeddings import HuggingFaceEmbeddings
             from langchain_chroma import Chroma
+            import shutil
 
             all_docs = []
 
+            # ── Load URLs one at a time ───────────────────────────
             if st.session_state.urls:
                 add_log(f"[LOADER]  Loading {len(st.session_state.urls)} URL(s)...")
                 for url in st.session_state.urls:
                     try:
                         add_log(f"          → {url}")
-                        docs = WebBaseLoader(
+                        from langchain_community.document_loaders import WebBaseLoader
+                        loader = WebBaseLoader(
                             url,
                             header_template={
                                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                                 "Accept-Language": "en-US,en;q=0.5",
                             }
-                        ).load()
+                        )
+                        docs = loader.load()
                         if docs and "just a moment" in docs[0].page_content.lower():
                             add_log(f"          ✗ {url} is Cloudflare protected — try a different URL")
                             continue
+                        # Keep only page_content, drop raw HTML from memory
                         docs = clean_metadata(docs)
                         all_docs.extend(docs)
-                        add_log(f"          ✓ Loaded {len(docs)} page(s)")
+                        del docs
+                        add_log(f"          ✓ Loaded successfully")
                     except Exception as e:
                         add_log(f"          ✗ Failed: {str(e)[:80]}")
 
+            # ── Load uploaded files one at a time ─────────────────
             if uploaded_files:
                 add_log(f"[LOADER]  Loading {len(uploaded_files)} file(s)...")
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    for uploaded_file in uploaded_files:
-                        file_path = os.path.join(tmpdir, uploaded_file.name)
-                        with open(file_path, "wb") as f:
-                            f.write(uploaded_file.getbuffer())
-                        add_log(f"          → {uploaded_file.name}")
-                        try:
-                            ext = uploaded_file.name.split(".")[-1].lower()
-                            if ext == "pdf":
-                                from langchain_community.document_loaders import PyPDFLoader
-                                loader = PyPDFLoader(file_path)
-                            elif ext == "docx":
-                                from langchain_community.document_loaders import Docx2txtLoader
-                                loader = Docx2txtLoader(file_path)
-                            elif ext in ["txt", "md"]:
-                                from langchain_community.document_loaders import TextLoader
-                                loader = TextLoader(file_path)
-                            elif ext == "csv":
-                                from langchain_community.document_loaders import CSVLoader
-                                loader = CSVLoader(file_path)
-                            else:
-                                add_log(f"          ✗ Unsupported file type: {ext}")
-                                continue
-                            docs = loader.load()
-                            all_docs.extend(docs)
-                            add_log(f"          ✓ Loaded {len(docs)} page(s)")
-                        except Exception as e:
-                            add_log(f"          ✗ Failed: {str(e)[:80]}")
+                for uploaded_file in uploaded_files:
+                    tmp_path = None
+                    try:
+                        # Write to temp file
+                        with tempfile.NamedTemporaryFile(
+                            delete=False,
+                            suffix=f".{uploaded_file.name.split('.')[-1]}"
+                        ) as tmp:
+                            tmp.write(uploaded_file.getbuffer())
+                            tmp_path = tmp.name
 
+                        add_log(f"          → {uploaded_file.name}")
+                        ext = uploaded_file.name.split(".")[-1].lower()
+
+                        if ext == "pdf":
+                            from langchain_community.document_loaders import PyPDFLoader
+                            loader = PyPDFLoader(tmp_path)
+                        elif ext == "docx":
+                            from langchain_community.document_loaders import Docx2txtLoader
+                            loader = Docx2txtLoader(tmp_path)
+                        elif ext in ["txt", "md"]:
+                            from langchain_community.document_loaders import TextLoader
+                            loader = TextLoader(tmp_path)
+                        elif ext == "csv":
+                            from langchain_community.document_loaders import CSVLoader
+                            loader = CSVLoader(tmp_path)
+                        else:
+                            add_log(f"          ✗ Unsupported file type: {ext}")
+                            continue
+
+                        docs = loader.load()
+                        all_docs.extend(docs)
+                        del docs
+                        add_log(f"          ✓ Loaded successfully")
+
+                    except Exception as e:
+                        add_log(f"          ✗ Failed: {str(e)[:80]}")
+                    finally:
+                        # Always delete temp file immediately to free disk space
+                        if tmp_path and os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+
+            # ── Chunk ─────────────────────────────────────────────
             add_log("")
             add_log(f"[SPLITTER] Total documents loaded: {len(all_docs)}")
             add_log("[SPLITTER] Chunking documents...")
-            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+
+            # Larger chunks = fewer vectors = less memory
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50
+            )
             chunks = splitter.split_documents(all_docs)
+
+            # Free raw docs from memory immediately
+            del all_docs
+            gc.collect()
+
             add_log(f"           ✓ Created {len(chunks)} chunks")
 
+            # ── Embed + Store ─────────────────────────────────────
             add_log("")
-            add_log("[EMBEDDER] Loading HuggingFace embeddings model...")
-            add_log("           (all-MiniLM-L6-v2 — first load may take ~30s)")
+            add_log("[EMBEDDER] Initialising Google Generative AI embeddings...")
+            add_log("           (API-based — no model download needed)")
 
-            with st.spinner("Hang on...."):
-                embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+            embeddings = get_embeddings()
+            add_log("           ✓ Embeddings ready")
 
-                add_log("           ✓ Embedding model loaded")
-                add_log("")
+            add_log("")
 
-                if st.session_state.append_mode and st.session_state.vectorstore:
-                    add_log("[CHROMA]   Appending to existing knowledge base...")
-                    st.session_state.vectorstore.add_documents(chunks)
-                    add_log(f"           ✓ Appended {len(chunks)} chunks to existing knowledge base")
-                else:
-                    add_log("[CHROMA]   Building new vector store...")
-                    vectorstore = Chroma.from_documents(
-                        documents=chunks,
-                        embedding=embeddings,
-                        collection_name="rag-session"
+            with st.spinner("Hang on. This might take a minute...."):
+                if st.session_state.append_mode and os.path.exists(CHROMA_DIR):
+                    add_log("[CHROMA]   Appending to existing knowledge base on disk...")
+                    vectorstore = Chroma(
+                        collection_name="rag-session",
+                        persist_directory=CHROMA_DIR,
+                        embedding_function=embeddings
                     )
-                    st.session_state.vectorstore = vectorstore
-                    add_log(f"           ✓ Indexed {len(chunks)} chunks into Chroma")
+                    vectorstore.add_documents(chunks)
+                    add_log(f"           ✓ Appended {len(chunks)} chunks")
+                else:
+                    # Clear old chroma dir if exists
+                    if os.path.exists(CHROMA_DIR):
+                        shutil.rmtree(CHROMA_DIR)
+                    add_log("[CHROMA]   Building new vector store on disk...")
+                    add_log(f"           Embedding {len(chunks)} chunks in batches...")
 
-            st.session_state.retriever = st.session_state.vectorstore.as_retriever(
+                    batch_size = 10
+                    vectorstore = None
+
+                    for i in range(0, len(chunks), batch_size):
+                        batch = chunks[i:i + batch_size]
+                        add_log(f"           Batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}...")
+                        if vectorstore is None:
+                            vectorstore = Chroma.from_documents(
+                                documents=batch,
+                                embedding=embeddings,
+                                collection_name="rag-session",
+                                persist_directory=CHROMA_DIR
+                            )
+                        else:
+                            vectorstore.add_documents(batch)
+                        if i + batch_size < len(chunks):
+                            time.sleep(8)
+
+                    add_log(f"           ✓ Indexed {len(chunks)} chunks to disk")
+
+            # Free chunks from memory
+            del chunks
+            gc.collect()
+
+            # Store only the retriever, not the full vectorstore
+            st.session_state.retriever = vectorstore.as_retriever(
                 search_type="mmr",
                 search_kwargs={"k": 3, "fetch_k": 10}
             )
@@ -456,12 +543,16 @@ with tab2:
             if st.button("🗑️ Delete Knowledge Base",
                          use_container_width=True,
                          type="primary"):
+                import shutil
+                if os.path.exists(CHROMA_DIR):
+                    shutil.rmtree(CHROMA_DIR)
                 st.session_state.ingested = False
-                st.session_state.vectorstore = None
                 st.session_state.retriever = None
                 st.session_state.urls = []
                 st.session_state.append_mode = False
                 st.session_state.url_input_key += 1
+                st.session_state.uploaded_files_count = 0
+                gc.collect()
                 st.rerun()
 
 
@@ -480,7 +571,7 @@ with tab3:
         with col1:
             query = st.text_input(
                 "Ask a question",
-                placeholder="what are adversarial attacks?",
+                placeholder="What are Adversarial Attacks?",
                 label_visibility="visible"
             )
         with col2:
@@ -525,7 +616,6 @@ with tab3:
                     stream_outputs, sim_results, run_id = traced_invoke(
                         query, st.session_state.retriever
                     )
-                    
 
                 # ── Routing decision ───────────────────────────────
                 if sim_results:
@@ -581,7 +671,6 @@ with tab3:
                 # ── Post stream grading inference ──────────────────
                 add_query_log("")
                 if result and result.get("generation"):
-                    # Infer grading results based on whether pipeline looped
                     if generate_count > 1:
                         add_query_log("[HALLUCINATION CHECK] ✗ Initial answer not grounded — retried")
                         add_query_log("[HALLUCINATION CHECK] ✓ Final answer grounded in documents")
@@ -619,10 +708,8 @@ with tab3:
                     # ── LangSmith trace ────────────────────────────
                     try:
                         if run_id:
-                            st.markdown("---")
-                            st.markdown("**LangSmith**")
                             share_link = None
-                            for wait in [2, 4, 6]:  # retry 3 times with increasing delays
+                            for wait in [2, 4, 6]:
                                 try:
                                     time.sleep(wait)
                                     share_link = client.share_run(run_id)
@@ -630,8 +717,12 @@ with tab3:
                                 except Exception:
                                     continue
                             if share_link:
+                                st.markdown("---")
+                                st.markdown("**LangSmith**")
                                 st.markdown(f"🔍 [View LangSmith Trace]({share_link})")
                             else:
+                                st.markdown("---")
+                                st.markdown("**LangSmith**")
                                 st.caption("Trace still syncing — check LangSmith dashboard directly.")
                     except Exception:
                         pass

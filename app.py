@@ -122,6 +122,7 @@ if "embed_api_calls" not in st.session_state:
 # ── Header ───────────────────────────────────────────────────────
 st.markdown("## 📚 Agentic RAG Application")
 st.caption("Retrieval Augmented Generation · Google Embeddings · Chroma + BM25 · LangGraph")
+st.markdown("[View on GitHub](https://github.com/shank343/Agentic_Rag)")
 
 tab1, tab2, tab3 = st.tabs(["ABOUT", "INGEST", "QUERY"])
 
@@ -147,13 +148,13 @@ with tab1:
     st.markdown("---")
     st.markdown("""
     This project implements an **Adaptive Retrieval-Augmented Generation (RAG)** pipeline
-    built on **LangGraph**. Unlike traditional RAG systems, this system intelligently decides
-    at runtime whether to answer from ingested documents or fall back to live web search,
-    depending on the semantic relevance of the question.
+    built on **LangGraph**. Unlike traditional RAG systems, this system dynamically routes 
+    queries between local retrieval and live web search based on semantic relevance.
 
     The system uses a **hybrid retrieval** strategy combining semantic search (Chroma + Google
-    embeddings) with keyword search (BM25) — giving the best of both worlds with no extra
-    model dependencies or API calls.
+    embeddings) with keyword search (BM25) — giving the best of both worlds.
+
+    The key components of the system in place: 
     """)
 
     col1, col2 = st.columns(2)
@@ -168,7 +169,7 @@ with tab1:
 
         **🟣 Hybrid Retrieve**
         Combines Chroma semantic search (60%) with BM25 keyword search (40%) via an
-        EnsembleRetriever — no extra models, no extra API calls, runs in memory.
+        EnsembleRetriever.
 
         ---
 
@@ -188,7 +189,7 @@ with tab1:
         `llama-3.1-8b-instant` generates the answer. `llama-3.3-70b-versatile` then runs
         two quality checks — a hallucination grader verifies grounding in source documents,
         and an answer grader checks whether the question is actually resolved. Fails trigger
-        retries or web search fallback.
+        generation retries or web search fallback.
         """)
 
     st.markdown("""
@@ -504,7 +505,7 @@ with tab3:
         col1, col2 = st.columns([5, 1])
         with col1:
             query = st.text_input("Ask a question",
-                                  placeholder="Why are unscalable actions important early on?",
+                                  placeholder="Why are early unscalable actions important?",
                                   label_visibility="visible")
         with col2:
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)

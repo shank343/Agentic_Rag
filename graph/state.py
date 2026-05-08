@@ -17,6 +17,7 @@ class GraphState(TypedDict):
     web_search: bool
     documents: List[str]
     retriever: Any
+    vectorstore: Any
     route_score: float
     route_decision: str
     generation_count: int

@@ -53,16 +53,14 @@ def grade_generation_grounded_in_documents_and_question(state: GraphState) -> st
 def route_question(state: GraphState) -> str:
     print("---ROUTE QUESTION---")
     question = state["question"]
-    retriever = state["retriever"]
+    vectorstore = state["vectorstore"]
 
-    # Similarity check against vectorstore
-    vectorstore = retriever.vectorstore
     results = vectorstore.similarity_search_with_score(question, k=1)
 
     if results:
         doc, score = results[0]
         # Chroma uses L2 distance — lower score = more similar
-        if score < 1.0:
+        if score < 0.7:
             print(f"---ROUTE TO RAG (similarity score: {score:.3f})---")
             return RETRIEVE
         else:

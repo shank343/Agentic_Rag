@@ -1,106 +1,60 @@
 import streamlit as st
-import tempfile
-import os
-import time
-import gc
+import os, time, gc, uuid, tempfile
 from dotenv import load_dotenv
 from langsmith import traceable, Client
 from langsmith.run_helpers import get_current_run_tree
 
-def clean_metadata(docs):
-    allowed_keys = {"source", "title"}  # keep it minimal
-    for doc in docs:
-        doc.metadata = {
-            k: v for k, v in doc.metadata.items() if k in allowed_keys
-        }
-    return docs
-
 load_dotenv()
 client = Client()
 
-# ── Chroma persist directory ─────────────────────────────────────
-import uuid
+# ── Constants ────────────────────────────────────────────────────
+MAX_CHUNKS     = 25      # 25 RPD per ingestion → 40 ingestions/day
+CHUNK_SIZE     = 1000    # ~250 tokens per chunk
+CHUNK_OVERLAP  = 100
+MAX_SESSIONS   = 5       # max ingestions per user session
+FETCH_K        = 3       # final docs returned
+SIM_THRESHOLD  = 0.7     # routing threshold
+
+# ── Session ID + Chroma dir ──────────────────────────────────────
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
 CHROMA_DIR = f"/tmp/chroma_{st.session_state.session_id}"
 
-st.set_page_config(
-    page_title="Agentic RAG App",
-    page_icon="📚",
-    layout="wide",
-)
+# ── Page config ──────────────────────────────────────────────────
+st.set_page_config(page_title="Agentic RAG App", page_icon="📚", layout="wide")
 
 st.markdown("""
 <style>
 #MainMenu, footer { visibility: hidden; }
 div[data-testid="InputInstructions"] { display: none; }
-
 .terminal-box {
-    background: #050508;
-    border: 1px solid #1a1a2e;
-    border-radius: 8px;
-    padding: 1.25rem 1.5rem;
-    font-family: monospace;
-    font-size: 0.85rem;
-    line-height: 1.8;
-    min-height: 120px;
-    color: #00ffcc;
+    background: #050508; border: 1px solid #1a1a2e; border-radius: 8px;
+    padding: 1.25rem 1.5rem; font-family: monospace; font-size: 0.85rem;
+    line-height: 1.8; min-height: 120px; color: #00ffcc;
 }
-.log-line  { margin: 0; padding: 0; }
+.log-line { margin: 0; padding: 0; }
 .log-info  { color: #4488ff; }
 .log-ok    { color: #44ff88; }
 .log-warn  { color: #ffaa00; }
 .log-error { color: #ff6688; }
 .log-dim   { color: #445566; }
-
 .url-chip {
-    display: inline-flex;
-    align-items: center;
-    background: #0d0d18;
-    border: 1px solid #2a2a4a;
-    border-radius: 20px;
-    padding: 0.25rem 0.75rem;
-    font-family: monospace;
-    font-size: 0.78rem;
-    color: #4488ff;
-    margin: 0.25rem;
-    word-break: break-all;
+    display: inline-flex; align-items: center; background: #0d0d18;
+    border: 1px solid #2a2a4a; border-radius: 20px; padding: 0.25rem 0.75rem;
+    font-family: monospace; font-size: 0.78rem; color: #4488ff;
+    margin: 0.25rem; word-break: break-all;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ──────────────────────────────────────────────────────
-st.markdown("## 📚 Agentic RAG Application")
-st.caption("Retrieval Augmented Generation · Google Embeddings · Chroma · LangGraph")
+# ── Helpers ──────────────────────────────────────────────────────
+def clean_metadata(docs):
+    for doc in docs:
+        doc.metadata = {k: v for k, v in doc.metadata.items() if k in {"source", "title"}}
+    return docs
 
-# ── Traceable invoke ─────────────────────────────────────────────
-@traceable(name="rag-pipeline-run")
-def traced_invoke(query, retriever):
-    from graph.graph import app
-
-    run_tree = get_current_run_tree()
-    run_id = str(run_tree.id) if run_tree else None
-
-    vectorstore = retriever.vectorstore
-    sim_results = vectorstore.similarity_search_with_score(query, k=1)
-    route_score = sim_results[0][1] if sim_results else 999.0
-
-    stream_outputs = list(app.stream({
-        "question": query,
-        "retriever": retriever,
-        "route_score": route_score,
-        "route_decision": "",
-        "web_search": False,
-        "documents": [],
-        "generation": "",
-    }, config={"recursion_limit": 10}))
-
-    return stream_outputs, sim_results, run_id
-
-# ── Get embeddings (API-based, no RAM footprint) ──────────────────
 def get_embeddings():
     from langchain_google_genai import GoogleGenerativeAIEmbeddings
-    import os
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     return GoogleGenerativeAIEmbeddings(
         model="gemini-embedding-001",
@@ -108,34 +62,53 @@ def get_embeddings():
         request_options={"timeout": 120}
     )
 
-# ── Get or load vectorstore from disk ────────────────────────────
+def build_ensemble_retriever(vectorstore, docs):
+    from langchain_community.retrievers import BM25Retriever
+    from langchain_classic.retrievers import EnsembleRetriever
+    chroma_ret = vectorstore.as_retriever(
+        search_type="similarity", search_kwargs={"k": FETCH_K})
+    bm25_ret = BM25Retriever.from_documents(docs, k=FETCH_K)
+    return EnsembleRetriever(
+        retrievers=[chroma_ret, bm25_ret], weights=[0.6, 0.4])
+
 def load_vectorstore_from_disk():
     from langchain_chroma import Chroma
     if os.path.exists(CHROMA_DIR):
-        embeddings = get_embeddings()
-        return Chroma(
-            collection_name="rag-session",
-            persist_directory=CHROMA_DIR,
-            embedding_function=embeddings
-        )
+        return Chroma(collection_name="rag-session",
+                      persist_directory=CHROMA_DIR,
+                      embedding_function=get_embeddings())
     return None
 
-# ── Session state init ──────────────────────────────────────────
+# ── Traceable invoke ─────────────────────────────────────────────
+@traceable(name="rag-pipeline-run")
+def traced_invoke(query, retriever, vectorstore):
+    from graph.graph import app
+    run_tree = get_current_run_tree()
+    run_id = str(run_tree.id) if run_tree else None
+    sim_results = vectorstore.similarity_search_with_score(query, k=1)
+    route_score = sim_results[0][1] if sim_results else 999.0
+    stream_outputs = list(app.stream({
+        "question": query, "retriever": retriever, "vectorstore": vectorstore,
+        "route_score": route_score, "route_decision": "",
+        "web_search": False, "documents": [], "generation": "",
+    }, config={"recursion_limit": 10}))
+    return stream_outputs, sim_results, run_id
+
+# ── Session state init ───────────────────────────────────────────
 if "urls" not in st.session_state:
-    st.session_state.urls = [
-        "https://lilianweng.github.io/posts/2023-10-25-adv-attack-llm/"
-    ]
+    st.session_state.urls = ["https://paulgraham.com/ds.html?utm_source=chatgpt.com"]
 if "retriever" not in st.session_state:
     st.session_state.retriever = None
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "bm25_docs" not in st.session_state:
+    st.session_state.bm25_docs = []
 if "ingested" not in st.session_state:
     st.session_state.ingested = False
-    # Try to load existing vectorstore from disk on startup
     vs = load_vectorstore_from_disk()
-    if vs:
-        st.session_state.retriever = vs.as_retriever(
-            search_type="mmr",
-            search_kwargs={"k": 3, "fetch_k": 10}
-        )
+    if vs and st.session_state.bm25_docs:
+        st.session_state.vectorstore = vs
+        st.session_state.retriever = build_ensemble_retriever(vs, st.session_state.bm25_docs)
         st.session_state.ingested = True
 if "append_mode" not in st.session_state:
     st.session_state.append_mode = False
@@ -143,98 +116,90 @@ if "url_input_key" not in st.session_state:
     st.session_state.url_input_key = 0
 if "uploaded_files_count" not in st.session_state:
     st.session_state.uploaded_files_count = 0
+if "embed_api_calls" not in st.session_state:
+    st.session_state.embed_api_calls = 0
 
-# ── Tabs ────────────────────────────────────────────────────────
+# ── Header ───────────────────────────────────────────────────────
+st.markdown("## 📚 Agentic RAG Application")
+st.caption("Retrieval Augmented Generation · Google Embeddings · Chroma + BM25 · LangGraph")
+
 tab1, tab2, tab3 = st.tabs(["ABOUT", "INGEST", "QUERY"])
-
 
 # ════════════════════════════════════════════════════════════════
 # TAB 1 — ABOUT
 # ════════════════════════════════════════════════════════════════
 with tab1:
-
     st.markdown("""
     <div style="display:flex; align-items:center; gap:1.5rem; padding:1.25rem 1.5rem;
-                background:#f8f9ff; border:1px solid #e0e0f0; border-radius:10px;
-                margin-bottom:2rem;">
+                background:#f8f9ff; border:1px solid #e0e0f0; border-radius:10px; margin-bottom:2rem;">
         <div style="width:48px; height:48px; border-radius:50%; background:#e8f4ff;
                     border:2px solid #4488ff; display:flex; align-items:center;
                     justify-content:center; font-size:1.3rem; flex-shrink:0;">👤</div>
         <div>
             <div style="font-size:1.05rem; font-weight:700; color:#111133;">Shashank M</div>
             <div style="font-size:0.78rem; color:#4488ff; letter-spacing:0.08em;
-                        font-family:monospace; margin-top:0.2rem;">
-                DATA SCIENTIST · ROLLS-ROYCE
-            </div>
+                        font-family:monospace; margin-top:0.2rem;">DATA SCIENTIST · ROLLS-ROYCE</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("### Agentic RAG System")
     st.markdown("---")
-
     st.markdown("""
     This project implements an **Adaptive Retrieval-Augmented Generation (RAG)** pipeline
-    built on **LangGraph** — a framework for building stateful, graph-based AI workflows.
-    Unlike traditional RAG systems that always retrieve from a fixed knowledge base, this
-    system intelligently decides at runtime whether to answer from ingested documents or
-    fall back to live web search, depending on the relevance of the question.
+    built on **LangGraph**. Unlike traditional RAG systems, this system intelligently decides
+    at runtime whether to answer from ingested documents or fall back to live web search,
+    depending on the semantic relevance of the question.
 
-    The system is composed of five specialised components:
+    The system uses a **hybrid retrieval** strategy combining semantic search (Chroma + Google
+    embeddings) with keyword search (BM25) — giving the best of both worlds with no extra
+    model dependencies or API calls.
     """)
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.markdown("""
         **🔵 Router**
-        Uses semantic similarity scoring to determine whether the user's question is
-        related to the ingested knowledge base. If the similarity score is below the
-        threshold, the question is routed to the vectorstore. Otherwise it goes directly
+        Uses semantic similarity scoring to route questions to the vectorstore or web search.
+        Questions with a similarity score below 0.7 are routed to RAG; others go directly
         to web search.
 
         ---
 
-        **🟣 Retrieve**
-        Fetches the most semantically relevant document chunks from the Chroma vectorstore
-        using Google's embedding model. Returns the top matching chunks for the grader
-        to evaluate.
+        **🟣 Hybrid Retrieve**
+        Combines Chroma semantic search (60%) with BM25 keyword search (40%) via an
+        EnsembleRetriever — no extra models, no extra API calls, runs in memory.
 
         ---
 
         **🟡 Document Grader**
-        Evaluates each retrieved chunk individually for relevance to the question. Irrelevant
-        chunks are dropped. If any chunk is marked irrelevant, a web search is triggered to
-        supplement the remaining relevant documents.
+        Uses `llama-3.1-8b-instant` to evaluate each retrieved chunk for relevance.
+        Irrelevant chunks are dropped and web search is triggered to supplement.
         """)
-
     with col2:
         st.markdown("""
         **🟠 Web Search**
-        Uses Tavily's search API to fetch real-time web results when the vectorstore cannot
-        fully answer the question. Web results are appended to the existing relevant chunks
-        to give the generator the richest possible context.
+        Tavily fetches real-time web results (capped at 1,000 chars per result) when the
+        vectorstore cannot fully answer the question. Results are appended to relevant chunks.
 
         ---
 
         **🔴 Generate + Quality Checks**
-        The generator produces an answer from the combined document context. Two quality
-        checks follow — a **hallucination grader** verifies the answer is grounded in the
-        source documents, and an **answer grader** checks whether it actually resolves the
-        question. If either check fails, the pipeline retries or falls back to web search.
+        `llama-3.1-8b-instant` generates the answer. `llama-3.3-70b-versatile` then runs
+        two quality checks — a hallucination grader verifies grounding in source documents,
+        and an answer grader checks whether the question is actually resolved. Fails trigger
+        retries or web search fallback.
         """)
 
     st.markdown("""
     ---
-    The pipeline runs on **Groq's inference API** — `llama-3.1-8b-instant` for document
-    relevance grading + answer generation and `llama-3.3-70b-versatile` for quality checks —
-    alongside **Tavily** for live web search and **Google Generative AI** embeddings for
-    semantic similarity. Every run is traced end-to-end with **LangSmith**.
+    Stack: **Groq** (`llama-3.1-8b-instant` for generation and document grading ·
+    `llama-3.3-70b-versatile` for hallucination and answer quality checks) · **Tavily** web search · **Google Generative AI** embeddings ·
+    **LangSmith** end-to-end tracing
     """)
 
     st.markdown("### Process Flow")
     st.image("static/Langgraph Adaptive Rag.png", use_container_width=True)
-
     st.markdown("---")
     st.info("👉 Click on the **INGEST** tab to test the app!")
 
@@ -243,29 +208,29 @@ with tab1:
 # TAB 2 — INGEST
 # ════════════════════════════════════════════════════════════════
 with tab2:
-
     st.markdown("#### Data Ingestion")
 
+    calls_left = MAX_SESSIONS - st.session_state.embed_api_calls
+    if st.session_state.embed_api_calls > 0:
+        st.caption(f"📊 Sessions: {st.session_state.embed_api_calls}/{MAX_SESSIONS} — {calls_left} remaining")
+
     if st.session_state.append_mode:
-        st.info("➕ **Append mode** — Add new sources below and click INGEST to add them to the existing knowledge base. Previously ingested documents are safe and will not be re-added.")
+        st.info(f"➕ **Append mode** — Add new sources and click INGEST. "
+                f"Max {MAX_CHUNKS} chunks per session. Previously ingested docs are safe.")
     else:
         st.caption("Add URLs and/or upload local files, then click Ingest to build the knowledge base.")
-        st.caption("_A link has been selected for you. You can remove it and add your own._")
+        st.caption(f"_A link has been preselected. Max {MAX_CHUNKS} chunks · {MAX_SESSIONS} ingestions per session._")
 
     st.markdown("---")
 
-    # ── URL Section ──────────────────────────────────────────────
+    # ── URL input ─────────────────────────────────────────────────
     st.markdown("**🌐 Add URLs**")
-
-    url_col1, url_col2 = st.columns([5, 1])
-    with url_col1:
-        url_input = st.text_input(
-            "Enter a URL",
-            placeholder="https://example.com/article",
-            key=f"url_input_{st.session_state.url_input_key}",
-            label_visibility="collapsed"
-        )
-    with url_col2:
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        url_input = st.text_input("URL", placeholder="https://example.com/article",
+                                  key=f"url_input_{st.session_state.url_input_key}",
+                                  label_visibility="collapsed")
+    with c2:
         add_url = st.button("＋ Add", key="add_url_btn")
 
     if add_url:
@@ -284,10 +249,10 @@ with tab2:
     if st.session_state.urls:
         st.markdown("**Added URLs:**")
         for i, url in enumerate(st.session_state.urls):
-            col_url, col_remove = st.columns([6, 1])
-            with col_url:
+            ca, cb = st.columns([6, 1])
+            with ca:
                 st.markdown(f'<div class="url-chip">🔗 {url}</div>', unsafe_allow_html=True)
-            with col_remove:
+            with cb:
                 if st.button("✕", key=f"remove_url_{i}"):
                     st.session_state.urls.pop(i)
                     st.rerun()
@@ -296,66 +261,59 @@ with tab2:
 
     st.markdown("---")
 
-    # ── File Upload Section ───────────────────────────────────────
+    # ── File upload ───────────────────────────────────────────────
     st.markdown("**📁 Upload Local Files**")
-
-    if st.session_state.append_mode:
-        st.caption("Upload new files to append to the existing knowledge base.")
-
     uploaded_files = st.file_uploader(
-        "Upload files",
-        accept_multiple_files=True,
+        "Files", accept_multiple_files=True,
         type=["pdf", "txt", "docx", "csv", "md"],
         label_visibility="collapsed",
         key=f"file_uploader_{st.session_state.append_mode}"
     )
-
     if uploaded_files:
         st.session_state.uploaded_files_count = len(uploaded_files)
-        st.caption(f"{len(uploaded_files)} new file(s) selected: {', '.join([f.name for f in uploaded_files])}")
+        st.caption(f"{len(uploaded_files)} file(s): {', '.join(f.name for f in uploaded_files)}")
 
     st.markdown("---")
 
-    # ── Ingest Button ─────────────────────────────────────────────
-    has_sources = (
-        len(st.session_state.urls) > 0 or
-        (uploaded_files is not None and len(uploaded_files) > 0) or
-        st.session_state.uploaded_files_count > 0
-    )
+    # ── Ingest button ─────────────────────────────────────────────
+    has_sources = (len(st.session_state.urls) > 0 or
+                   bool(uploaded_files) or
+                   st.session_state.uploaded_files_count > 0)
     already_ingested = st.session_state.ingested and not st.session_state.append_mode
-    ingest_btn = st.button(
-        "⚡ INGEST",
-        disabled=already_ingested or not has_sources,
-        type="primary"
-    )
+    budget_exhausted = st.session_state.embed_api_calls >= MAX_SESSIONS
+
+    ingest_btn = st.button("⚡ INGEST",
+                           disabled=already_ingested or not has_sources or budget_exhausted,
+                           type="primary")
 
     log_placeholder = st.empty()
     if already_ingested:
-        st.caption("⚠️ Knowledge base already exists. Use **Add More Documents** below to append.")
+        st.caption("⚠️ Knowledge base exists. Use **Add More Documents** to append.")
+    if budget_exhausted:
+        st.error(f"🚫 Session limit reached ({MAX_SESSIONS} ingestions). Start a new session.")
     status_placeholder = st.empty()
 
     def render_log(lines):
         def style(line):
             l = line.lower()
-            if "✓" in line or "complete" in l or "success" in l or "done" in l:
+            if "✓" in line or "complete" in l or "done" in l:
                 return f'<p class="log-line log-ok">{line}</p>'
             elif "✗" in line or "error" in l or "failed" in l:
                 return f'<p class="log-line log-error">{line}</p>'
-            elif "warning" in l or "warn" in l:
+            elif "⚠" in line or "warn" in l:
                 return f'<p class="log-line log-warn">{line}</p>'
             elif line.startswith("//"):
                 return f'<p class="log-line log-dim">{line}</p>'
             else:
                 return f'<p class="log-line log-info">{line}</p>'
-        html = '<div class="terminal-box">' + "".join(style(l) for l in lines) + '</div>'
-        log_placeholder.markdown(html, unsafe_allow_html=True)
+        log_placeholder.markdown(
+            '<div class="terminal-box">' + "".join(style(l) for l in lines) + '</div>',
+            unsafe_allow_html=True)
 
-    if not ingest_btn:
-        render_log(["// Waiting for sources and ingest command..."])
+    render_log(["// Waiting for sources and ingest command..."])
 
-    if ingest_btn and has_sources and not already_ingested:
+    if ingest_btn and has_sources and not already_ingested and not budget_exhausted:
         logs = []
-
         def add_log(msg):
             logs.append(msg)
             render_log(logs)
@@ -367,50 +325,39 @@ with tab2:
 
             all_docs = []
 
-            # ── Load URLs one at a time ───────────────────────────
+            # ── Load URLs ─────────────────────────────────────────
             if st.session_state.urls:
                 add_log(f"[LOADER]  Loading {len(st.session_state.urls)} URL(s)...")
                 for url in st.session_state.urls:
                     try:
                         add_log(f"          → {url}")
                         from langchain_community.document_loaders import WebBaseLoader
-                        loader = WebBaseLoader(
-                            url,
-                            header_template={
-                                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                "Accept-Language": "en-US,en;q=0.5",
-                            }
-                        )
-                        docs = loader.load()
+                        docs = WebBaseLoader(url, header_template={
+                            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5",
+                        }).load()
                         if docs and "just a moment" in docs[0].page_content.lower():
-                            add_log(f"          ✗ {url} is Cloudflare protected — try a different URL")
+                            add_log(f"          ✗ Cloudflare protected — try a different URL")
                             continue
-                        # Keep only page_content, drop raw HTML from memory
-                        docs = clean_metadata(docs)
-                        all_docs.extend(docs)
+                        all_docs.extend(clean_metadata(docs))
                         del docs
-                        add_log(f"          ✓ Loaded successfully")
+                        add_log(f"          ✓ Loaded")
                     except Exception as e:
-                        add_log(f"          ✗ Failed: {str(e)[:80]}")
+                        add_log(f"          ✗ {str(e)[:80]}")
 
-            # ── Load uploaded files one at a time ─────────────────
+            # ── Load files ────────────────────────────────────────
             if uploaded_files:
                 add_log(f"[LOADER]  Loading {len(uploaded_files)} file(s)...")
-                for uploaded_file in uploaded_files:
+                for uf in uploaded_files:
                     tmp_path = None
                     try:
-                        # Write to temp file
-                        with tempfile.NamedTemporaryFile(
-                            delete=False,
-                            suffix=f".{uploaded_file.name.split('.')[-1]}"
-                        ) as tmp:
-                            tmp.write(uploaded_file.getbuffer())
+                        with tempfile.NamedTemporaryFile(delete=False,
+                                suffix=f".{uf.name.split('.')[-1]}") as tmp:
+                            tmp.write(uf.getbuffer())
                             tmp_path = tmp.name
-
-                        add_log(f"          → {uploaded_file.name}")
-                        ext = uploaded_file.name.split(".")[-1].lower()
-
+                        add_log(f"          → {uf.name}")
+                        ext = uf.name.split(".")[-1].lower()
                         if ext == "pdf":
                             from langchain_community.document_loaders import PyPDFLoader
                             loader = PyPDFLoader(tmp_path)
@@ -424,137 +371,121 @@ with tab2:
                             from langchain_community.document_loaders import CSVLoader
                             loader = CSVLoader(tmp_path)
                         else:
-                            add_log(f"          ✗ Unsupported file type: {ext}")
+                            add_log(f"          ✗ Unsupported: {ext}")
                             continue
-
                         docs = loader.load()
-                        all_docs.extend(docs)
+                        all_docs.extend(clean_metadata(docs))
                         del docs
-                        add_log(f"          ✓ Loaded successfully")
-
+                        add_log(f"          ✓ Loaded")
                     except Exception as e:
-                        add_log(f"          ✗ Failed: {str(e)[:80]}")
+                        add_log(f"          ✗ {str(e)[:80]}")
                     finally:
-                        # Always delete temp file immediately to free disk space
                         if tmp_path and os.path.exists(tmp_path):
                             os.unlink(tmp_path)
 
             # ── Chunk ─────────────────────────────────────────────
             add_log("")
-            add_log(f"[SPLITTER] Total documents loaded: {len(all_docs)}")
-            add_log("[SPLITTER] Chunking documents...")
-
-            # Larger chunks = fewer vectors = less memory
+            add_log(f"[SPLITTER] {len(all_docs)} doc(s) loaded — chunking...")
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50
-            )
+                chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
             chunks = splitter.split_documents(all_docs)
-
-            # Free raw docs from memory immediately
             del all_docs
             gc.collect()
 
-            add_log(f"           ✓ Created {len(chunks)} chunks")
+            if len(chunks) > MAX_CHUNKS:
+                add_log(f"           ⚠️ Capping at {MAX_CHUNKS} chunks (session limit)")
+                chunks = chunks[:MAX_CHUNKS]
+            add_log(f"           ✓ {len(chunks)} chunks (~{len(chunks) * 250:,} tokens)")
 
-            # ── Embed + Store ─────────────────────────────────────
+            # ── Embed ─────────────────────────────────────────────
             add_log("")
-            add_log("[EMBEDDER] Initialising Google Generative AI embeddings...")
-            add_log("           (API-based — no model download needed)")
-
+            add_log("[EMBEDDER] Initialising Google embeddings...")
             embeddings = get_embeddings()
-            add_log("           ✓ Embeddings ready")
-
-            add_log("")
+            texts = [c.page_content for c in chunks]
+            metadatas = [c.metadata for c in chunks]
+            add_log(f"[EMBEDDER] Embedding {len(texts)} chunks...")
 
             with st.spinner("Hang on. This might take a minute...."):
+                embeddings_list = embeddings.embed_documents(texts)
+                add_log(f"           ✓ Embedded {len(texts)} chunks")
+
+                # ── Chroma ────────────────────────────────────────
                 if st.session_state.append_mode and os.path.exists(CHROMA_DIR):
-                    add_log("[CHROMA]   Appending to existing knowledge base on disk...")
-                    vectorstore = Chroma(
-                        collection_name="rag-session",
-                        persist_directory=CHROMA_DIR,
-                        embedding_function=embeddings
-                    )
-                    vectorstore.add_documents(chunks)
+                    add_log("[CHROMA]   Appending to existing store...")
+                    vs = Chroma(collection_name="rag-session",
+                                persist_directory=CHROMA_DIR,
+                                embedding_function=embeddings)
+                    base_id = str(int(time.time()))
+                    vs._collection.add(
+                        ids=[f"{base_id}_{i}" for i in range(len(chunks))],
+                        embeddings=embeddings_list,
+                        documents=texts, metadatas=metadatas)
+                    st.session_state.bm25_docs.extend(chunks)
                     add_log(f"           ✓ Appended {len(chunks)} chunks")
                 else:
-                    # Clear old chroma dir if exists
                     if os.path.exists(CHROMA_DIR):
                         shutil.rmtree(CHROMA_DIR)
-                    add_log("[CHROMA]   Building new vector store on disk...")
-                    add_log(f"           Embedding {len(chunks)} chunks in batches...")
+                    add_log("[CHROMA]   Building new vector store...")
+                    vs = Chroma(collection_name="rag-session",
+                                persist_directory=CHROMA_DIR,
+                                embedding_function=embeddings)
+                    vs._collection.add(
+                        ids=[str(i) for i in range(len(chunks))],
+                        embeddings=embeddings_list,
+                        documents=texts, metadatas=metadatas)
+                    st.session_state.bm25_docs = list(chunks)
+                    add_log(f"           ✓ Indexed {len(chunks)} chunks")
 
-                    batch_size = 10
-                    vectorstore = None
+            st.session_state.embed_api_calls += 1
+            remaining = MAX_SESSIONS - st.session_state.embed_api_calls
+            add_log(f"           ✓ Session {st.session_state.embed_api_calls}/{MAX_SESSIONS} — {remaining} remaining")
 
-                    for i in range(0, len(chunks), batch_size):
-                        batch = chunks[i:i + batch_size]
-                        add_log(f"           Batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}...")
-                        if vectorstore is None:
-                            vectorstore = Chroma.from_documents(
-                                documents=batch,
-                                embedding=embeddings,
-                                collection_name="rag-session",
-                                persist_directory=CHROMA_DIR
-                            )
-                        else:
-                            vectorstore.add_documents(batch)
-                        if i + batch_size < len(chunks):
-                            time.sleep(8)
-
-                    add_log(f"           ✓ Indexed {len(chunks)} chunks to disk")
-
-            # Free chunks from memory
             del chunks
             gc.collect()
 
-            # Store only the retriever, not the full vectorstore
-            st.session_state.retriever = vectorstore.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": 3, "fetch_k": 10}
-            )
+            # ── Hybrid retriever ──────────────────────────────────
+            add_log("[RETRIEVER] Building hybrid retriever (Chroma 60% + BM25 40%)...")
+            st.session_state.vectorstore = vs
+            st.session_state.retriever = build_ensemble_retriever(vs, st.session_state.bm25_docs)
             st.session_state.ingested = True
             st.session_state.append_mode = False
             st.session_state.urls = []
             st.session_state.uploaded_files_count = 0
 
-            add_log("           ✓ Retriever created and stored in session")
+            add_log("            ✓ Hybrid retriever ready")
             add_log("")
-            add_log("✓ Ingestion complete! Head to the QUERY tab to start asking questions.")
+            add_log("✓ Ingestion complete! Head to the QUERY tab.")
             status_placeholder.success("✅ Knowledge base ready! Go to the QUERY tab.")
 
         except Exception as e:
             add_log(f"✗ Error: {str(e)}")
             status_placeholder.error(f"Ingestion failed: {str(e)}")
 
-    # ── Manage Knowledge Base ─────────────────────────────────────
+    # ── Manage KB ─────────────────────────────────────────────────
     if st.session_state.ingested:
         st.markdown("---")
         st.markdown("**🗄️ Manage Knowledge Base**")
-        st.caption("Knowledge base is active in this session.")
-
-        col_add, col_del = st.columns([1, 1])
-
-        with col_add:
-            if st.button("➕ Add More Documents", use_container_width=True):
+        ca, cb = st.columns(2)
+        with ca:
+            add_dis = st.session_state.embed_api_calls >= MAX_SESSIONS
+            if st.button("➕ Add More Documents", use_container_width=True, disabled=add_dis):
                 st.session_state.append_mode = True
                 st.session_state.urls = []
                 st.session_state.url_input_key += 1
                 st.rerun()
-
-        with col_del:
-            if st.button("🗑️ Delete Knowledge Base",
-                         use_container_width=True,
-                         type="primary"):
+            if add_dis:
+                st.caption("Session limit reached.")
+        with cb:
+            if st.button("🗑️ Delete Knowledge Base", use_container_width=True, type="primary"):
                 import shutil
                 if os.path.exists(CHROMA_DIR):
                     shutil.rmtree(CHROMA_DIR)
-                st.session_state.ingested = False
-                st.session_state.retriever = None
-                st.session_state.urls = []
-                st.session_state.append_mode = False
-                st.session_state.url_input_key += 1
-                st.session_state.uploaded_files_count = 0
+                st.session_state.update({
+                    "ingested": False, "retriever": None, "vectorstore": None,
+                    "bm25_docs": [], "urls": [], "append_mode": False,
+                    "url_input_key": st.session_state.url_input_key + 1,
+                    "uploaded_files_count": 0
+                })
                 gc.collect()
                 st.rerun()
 
@@ -572,11 +503,9 @@ with tab3:
 
         col1, col2 = st.columns([5, 1])
         with col1:
-            query = st.text_input(
-                "Ask a question",
-                placeholder="What are Adversarial Attacks?",
-                label_visibility="visible"
-            )
+            query = st.text_input("Ask a question",
+                                  placeholder="Why are unscalable actions important early on?",
+                                  label_visibility="visible")
         with col2:
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             ask = st.button("▶ ASK")
@@ -585,19 +514,18 @@ with tab3:
             st.warning("Please enter a question first.")
 
         if ask and query.strip():
-
             from graph.consts import GENERATE, GRADE_DOCUMENTS, RETRIEVE, WEBSEARCH
 
-            query_log_placeholder = st.empty()
-            query_logs = []
+            log_ph = st.empty()
+            qlogs = []
 
             def add_query_log(msg):
-                query_logs.append(msg)
+                qlogs.append(msg)
                 def style(line):
                     l = line.lower()
-                    if "✓" in line or "complete" in l or "grounded" in l or "useful" in l:
+                    if "✓" in line or "complete" in l or "grounded" in l:
                         return f'<p class="log-line log-ok">{line}</p>'
-                    elif "✗" in line or "error" in l or "not supported" in l or "not useful" in l or "failed" in l:
+                    elif "✗" in line or "error" in l or "not supported" in l or "not useful" in l:
                         return f'<p class="log-line log-error">{line}</p>'
                     elif "web search" in l or "irrelevant" in l:
                         return f'<p class="log-line log-warn">{line}</p>'
@@ -605,110 +533,92 @@ with tab3:
                         return f'<p class="log-line log-dim">{line}</p>'
                     else:
                         return f'<p class="log-line log-info">{line}</p>'
-                html = '<div class="terminal-box">' + "".join(
-                    style(l) for l in query_logs
-                ) + '</div>'
-                query_log_placeholder.markdown(html, unsafe_allow_html=True)
+                log_ph.markdown(
+                    '<div class="terminal-box">' + "".join(style(l) for l in qlogs) + '</div>',
+                    unsafe_allow_html=True)
 
             try:
                 add_query_log(f"// Question: {query}")
                 add_query_log("")
-                add_query_log("[ROUTER]   Running similarity check against vectorstore...")
+                add_query_log("[ROUTER]   Running similarity check...")
 
                 with st.spinner("Agents are working..."):
                     stream_outputs, sim_results, run_id = traced_invoke(
-                        query, st.session_state.retriever
-                    )
+                        query, st.session_state.retriever, st.session_state.vectorstore)
 
-                # ── Routing decision ───────────────────────────────
                 if sim_results:
-                    doc, score = sim_results[0]
-                    if score < 1.0:
-                        add_query_log(f"[ROUTER]   Similarity score: {score:.3f} → below threshold (1.0)")
-                        add_query_log("[ROUTER]   Decision: → VECTORSTORE (RAG) ✓")
+                    _, score = sim_results[0]
+                    if score < SIM_THRESHOLD:
+                        add_query_log(f"[ROUTER]   Score: {score:.3f} → below {SIM_THRESHOLD} → VECTORSTORE (RAG) ✓")
                     else:
-                        add_query_log(f"[ROUTER]   Similarity score: {score:.3f} → above threshold (1.0)")
-                        add_query_log("[ROUTER]   Decision: → WEB SEARCH")
+                        add_query_log(f"[ROUTER]   Score: {score:.3f} → above {SIM_THRESHOLD} → WEB SEARCH")
                 else:
-                    add_query_log("[ROUTER]   No results found in vectorstore")
-                    add_query_log("[ROUTER]   Decision: → WEB SEARCH")
+                    add_query_log("[ROUTER]   No results — WEB SEARCH")
 
                 add_query_log("")
 
-                # ── Stream node logs ───────────────────────────────
                 result = None
                 generate_count = 0
-                web_search_triggered = False
+                web_triggered = False
                 retrieved_count = 0
 
                 for output in stream_outputs:
                     for node_name, node_output in output.items():
-
                         if node_name == RETRIEVE:
                             retrieved_count = len(node_output.get("documents", []))
-                            add_query_log(f"[RETRIEVE]  ✓ Retrieved {retrieved_count} document chunk(s) from vectorstore")
-
+                            add_query_log(f"[RETRIEVE]  ✓ {retrieved_count} chunk(s) — semantic + keyword hybrid")
                         elif node_name == GRADE_DOCUMENTS:
                             web = node_output.get("web_search", False)
                             if web:
-                                add_query_log(f"[GRADER]    Some chunk(s) dropped as irrelevant")
+                                add_query_log("[GRADER]    Some chunk(s) dropped as irrelevant")
                                 add_query_log("[GRADER]    → Adding web search to supplement")
                             else:
-                                add_query_log(f"[GRADER]    ✓ All {retrieved_count} chunk(s) relevant → proceeding to generate")
-
+                                add_query_log(f"[GRADER]    ✓ All {retrieved_count} chunk(s) relevant")
                         elif node_name == WEBSEARCH:
-                            web_search_triggered = True
-                            add_query_log("[WEB SEARCH] Fetching results from the web...")
-                            add_query_log("[WEB SEARCH] ✓ Web results fetched successfully")
-
+                            web_triggered = True
+                            add_query_log("[WEB SEARCH] Fetching from web...")
+                            add_query_log("[WEB SEARCH] ✓ Web results fetched")
                         elif node_name == GENERATE:
                             generate_count += 1
-                            if generate_count > 1:
-                                add_query_log(f"[GENERATE]  Re-generating answer (attempt {generate_count})...")
-                            else:
-                                add_query_log("[GENERATE]  Drafting answer from documents...")
+                            msg = f"Re-generating (attempt {generate_count})..." if generate_count > 1 else "Drafting answer..."
+                            add_query_log(f"[GENERATE]  {msg}")
                             add_query_log("[GENERATE]  ✓ Answer drafted")
-
                         result = node_output
 
-                # ── Post stream grading inference ──────────────────
                 add_query_log("")
                 if result and result.get("generation"):
                     if generate_count > 1:
                         add_query_log("[HALLUCINATION CHECK] ✗ Initial answer not grounded — retried")
-                        add_query_log("[HALLUCINATION CHECK] ✓ Final answer grounded in documents")
+                        add_query_log("[HALLUCINATION CHECK] ✓ Final answer grounded")
                     else:
-                        add_query_log("[HALLUCINATION CHECK] ✓ Answer is grounded in documents")
+                        add_query_log("[HALLUCINATION CHECK] ✓ Answer grounded in documents")
 
-                    if web_search_triggered and generate_count > 1:
-                        add_query_log("[ANSWER CHECK]        ✗ Initial answer did not address question — web search added")
-                        add_query_log("[ANSWER CHECK]        ✓ Final answer addresses the question")
+                    if web_triggered and generate_count > 1:
+                        add_query_log("[ANSWER CHECK]        ✗ Initial answer insufficient — web search added")
+                        add_query_log("[ANSWER CHECK]        ✓ Final answer addresses question")
                     else:
-                        add_query_log("[ANSWER CHECK]        ✓ Answer addresses the question")
+                        add_query_log("[ANSWER CHECK]        ✓ Answer addresses question")
 
                     add_query_log("")
                     add_query_log("✓ Pipeline complete.")
 
-                    # ── Answer ────────────────────────────────────
                     st.markdown("---")
                     st.markdown("**Answer:**")
                     st.markdown(result["generation"])
 
-                    # ── Sources consulted (web search only) ────────
-                    if web_search_triggered:
-                        docs = result.get("documents", [])
-                        if docs:
+                    if web_triggered:
+                        seen, sources = set(), []
+                        for doc in result.get("documents", []):
+                            for s in doc.metadata.get("sources", []):
+                                if s and s not in seen:
+                                    seen.add(s)
+                                    sources.append(s)
+                        if sources:
                             st.markdown("---")
                             st.markdown("**Sources consulted**")
-                            seen = set()
-                            for doc in docs:
-                                sources = doc.metadata.get("sources", [])
-                                for source in sources:
-                                    if source and source not in seen:
-                                        seen.add(source)
-                                        st.markdown(f"- {source}")
+                            for s in sources:
+                                st.markdown(f"- {s}")
 
-                    # ── LangSmith trace ────────────────────────────
                     try:
                         if run_id:
                             share_link = None
@@ -719,27 +629,25 @@ with tab3:
                                     break
                                 except Exception:
                                     continue
+                            st.markdown("---")
+                            st.markdown("**LangSmith**")
                             if share_link:
-                                st.markdown("---")
-                                st.markdown("**LangSmith**")
                                 st.markdown(f"🔍 [View LangSmith Trace]({share_link})")
                             else:
-                                st.markdown("---")
-                                st.markdown("**LangSmith**")
-                                st.caption("Trace still syncing — check LangSmith dashboard directly.")
+                                st.caption("Trace syncing — check LangSmith dashboard.")
                     except Exception:
                         pass
 
                 else:
                     add_query_log("[HALLUCINATION CHECK] ✗ Answer failed grounding check")
-                    add_query_log("[ANSWER CHECK]        ✗ Answer did not address the question")
-                    add_query_log("✗ Pipeline ended without a valid answer.")
-                    st.warning("No answer could be generated. Try rephrasing your question.")
+                    add_query_log("[ANSWER CHECK]        ✗ Answer did not address question")
+                    add_query_log("✗ Pipeline ended without valid answer.")
+                    st.warning("No answer generated. Try rephrasing your question.")
 
             except Exception as e:
                 if "recursion" in str(e).lower():
-                    add_query_log("✗ Pipeline exceeded maximum steps — could not generate a satisfactory answer.")
-                    st.error("The pipeline looped too many times. Try rephrasing your question.")
+                    add_query_log("✗ Pipeline exceeded max steps.")
+                    st.error("Too many retries. Try rephrasing your question.")
                 else:
                     add_query_log(f"✗ Error: {str(e)}")
                     st.error(f"Error: {str(e)}")

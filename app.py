@@ -607,18 +607,34 @@ with tab3:
                     st.markdown("**Answer:**")
                     st.markdown(result["generation"])
 
-                    if web_triggered:
-                        seen, sources = set(), []
-                        for doc in result.get("documents", []):
+                    docs = result.get("documents", [])
+                    if docs:
+                        seen, rag_sources, web_sources = set(), [], []
+
+                        for doc in docs:
+                            # RAG chunk sources — stored in metadata["source"] by loaders
+                            src = doc.metadata.get("source", "")
+                            if src and src not in seen:
+                                seen.add(src)
+                                rag_sources.append(src)
+
+                            # Web search sources — stored in metadata["sources"] by web_search node
                             for s in doc.metadata.get("sources", []):
                                 if s and s not in seen:
                                     seen.add(s)
-                                    sources.append(s)
-                        if sources:
+                                    web_sources.append(s)
+
+                        if rag_sources or web_sources:
                             st.markdown("---")
                             st.markdown("**Sources consulted**")
-                            for s in sources:
-                                st.markdown(f"- {s}")
+                            if rag_sources:
+                                st.markdown("*From knowledge base:*")
+                                for s in rag_sources:
+                                    st.markdown(f"- {s}")
+                            if web_sources:
+                                st.markdown("*From web search:*")
+                                for s in web_sources:
+                                    st.markdown(f"- {s}")
 
                     try:
                         if run_id:

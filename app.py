@@ -609,9 +609,6 @@ with tab3:
                         # If previous node was GENERATE → hallucination check failed
                         if prev_node == GENERATE:
                             add_query_log("[HALLUCINATION CHECK] ✗ Answer not grounded — retrying")
-                        # If previous node was WEBSEARCH and not first generate → answer check failed
-                        elif prev_node == WEBSEARCH and generate_count > 1:
-                            add_query_log("[ANSWER CHECK]        ✗ Answer did not address question — web search added")
  
                         msg = f"Re-generating (attempt {generate_count})..." if generate_count > 1 else "Drafting answer..."
                         add_query_log(f"[GENERATE]  {msg}")
@@ -625,6 +622,7 @@ with tab3:
                         # If next is WEBSEARCH → hallucination passed, answer failed
                         elif next_node == WEBSEARCH:
                             add_query_log("[HALLUCINATION CHECK] ✓ Answer grounded in documents")
+                            add_query_log("[ANSWER CHECK]        ✗ Answer did not address question — web search added")
                         # If next is GENERATE → hallucination failed (logged on next iteration)
  
                 add_query_log("")

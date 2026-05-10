@@ -65,9 +65,17 @@ def get_embeddings():
 def build_ensemble_retriever(vectorstore, docs):
     from langchain_community.retrievers import BM25Retriever
     from langchain_classic.retrievers import EnsembleRetriever
+    import re
+
+    def preprocess(text):
+        # lowercase, split on non-alphanumeric
+        text = text.lower()
+        return re.findall(r'\w+', text)
+
     chroma_ret = vectorstore.as_retriever(
         search_type="similarity", search_kwargs={"k": FETCH_K})
-    bm25_ret = BM25Retriever.from_documents(docs, k=FETCH_K)
+    bm25_ret = BM25Retriever.from_documents(
+        docs, k=FETCH_K, preprocess_func=preprocess)
     return EnsembleRetriever(
         retrievers=[chroma_ret, bm25_ret], weights=[0.6, 0.4])
 
@@ -375,6 +383,8 @@ with tab2:
                             add_log(f"          ✗ Unsupported: {ext}")
                             continue
                         docs = loader.load()
+                        for doc in docs:
+                            doc.metadata["source"] = uf.name
                         all_docs.extend(clean_metadata(docs))
                         del docs
                         add_log(f"          ✓ Loaded")
@@ -547,6 +557,16 @@ with tab3:
                     stream_outputs, sim_results, run_id = traced_invoke(
                         query, st.session_state.retriever, st.session_state.vectorstore)
 
+                # ── Build ordered event list from stream ──────────
+                # Each event: (node_name, node_output)
+                ordered_events = []
+                for output in stream_outputs:
+                    for node_name, node_output in output.items():
+                        ordered_events.append((node_name, node_output))
+ 
+                result = ordered_events[-1][1] if ordered_events else None
+ 
+                # ── Router log ────────────────────────────────────
                 if sim_results:
                     _, score = sim_results[0]
                     if score < SIM_THRESHOLD:
@@ -555,75 +575,81 @@ with tab3:
                         add_query_log(f"[ROUTER]   Score: {score:.3f} → above {SIM_THRESHOLD} → WEB SEARCH")
                 else:
                     add_query_log("[ROUTER]   No results — WEB SEARCH")
-
+ 
                 add_query_log("")
-
-                result = None
-                generate_count = 0
-                web_triggered = False
+ 
+                # ── Replay node logs in exact execution order ─────
                 retrieved_count = 0
-
-                for output in stream_outputs:
-                    for node_name, node_output in output.items():
-                        if node_name == RETRIEVE:
-                            retrieved_count = len(node_output.get("documents", []))
-                            add_query_log(f"[RETRIEVE]  ✓ {retrieved_count} chunk(s) — semantic + keyword hybrid")
-                        elif node_name == GRADE_DOCUMENTS:
-                            web = node_output.get("web_search", False)
-                            if web:
-                                add_query_log("[GRADER]    Some chunk(s) dropped as irrelevant")
-                                add_query_log("[GRADER]    → Adding web search to supplement")
-                            else:
-                                add_query_log(f"[GRADER]    ✓ All {retrieved_count} chunk(s) relevant")
-                        elif node_name == WEBSEARCH:
-                            web_triggered = True
-                            add_query_log("[WEB SEARCH] Fetching from web...")
-                            add_query_log("[WEB SEARCH] ✓ Web results fetched")
-                        elif node_name == GENERATE:
-                            generate_count += 1
-                            msg = f"Re-generating (attempt {generate_count})..." if generate_count > 1 else "Drafting answer..."
-                            add_query_log(f"[GENERATE]  {msg}")
-                            add_query_log("[GENERATE]  ✓ Answer drafted")
-                        result = node_output
-
+                generate_count = 0
+ 
+                for i, (node_name, node_output) in enumerate(ordered_events):
+                    prev_node = ordered_events[i-1][0] if i > 0 else None
+                    next_node = ordered_events[i+1][0] if i < len(ordered_events)-1 else None
+ 
+                    if node_name == RETRIEVE:
+                        retrieved_count = len(node_output.get("documents", []))
+                        add_query_log(f"[RETRIEVE]  ✓ {retrieved_count} chunk(s) — semantic + keyword hybrid")
+ 
+                    elif node_name == GRADE_DOCUMENTS:
+                        web = node_output.get("web_search", False)
+                        if web:
+                            add_query_log("[GRADER]    Some chunk(s) dropped as irrelevant")
+                            add_query_log("[GRADER]    → Adding web search to supplement")
+                        else:
+                            add_query_log(f"[GRADER]    ✓ All {retrieved_count} chunk(s) relevant")
+ 
+                    elif node_name == WEBSEARCH:
+                        add_query_log("[WEB SEARCH] Fetching from web...")
+                        add_query_log("[WEB SEARCH] ✓ Web results fetched")
+ 
+                    elif node_name == GENERATE:
+                        generate_count += 1
+ 
+                        # What triggered this generate?
+                        # If previous node was GENERATE → hallucination check failed
+                        if prev_node == GENERATE:
+                            add_query_log("[HALLUCINATION CHECK] ✗ Answer not grounded — retrying")
+                        # If previous node was WEBSEARCH and not first generate → answer check failed
+                        elif prev_node == WEBSEARCH and generate_count > 1:
+                            add_query_log("[ANSWER CHECK]        ✗ Answer did not address question — web search added")
+ 
+                        msg = f"Re-generating (attempt {generate_count})..." if generate_count > 1 else "Drafting answer..."
+                        add_query_log(f"[GENERATE]  {msg}")
+                        add_query_log("[GENERATE]  ✓ Answer drafted")
+ 
+                        # What comes after this generate?
+                        # If it's the last node → both checks passed
+                        if next_node is None:
+                            add_query_log("[HALLUCINATION CHECK] ✓ Answer grounded in documents")
+                            add_query_log("[ANSWER CHECK]        ✓ Answer addresses question")
+                        # If next is WEBSEARCH → hallucination passed, answer failed
+                        elif next_node == WEBSEARCH:
+                            add_query_log("[HALLUCINATION CHECK] ✓ Answer grounded in documents")
+                        # If next is GENERATE → hallucination failed (logged on next iteration)
+ 
                 add_query_log("")
+                add_query_log("✓ Pipeline complete.")
+ 
+                # ── Answer ────────────────────────────────────────
                 if result and result.get("generation"):
-                    if generate_count > 1:
-                        add_query_log("[HALLUCINATION CHECK] ✗ Initial answer not grounded — retried")
-                        add_query_log("[HALLUCINATION CHECK] ✓ Final answer grounded")
-                    else:
-                        add_query_log("[HALLUCINATION CHECK] ✓ Answer grounded in documents")
-
-                    if web_triggered and generate_count > 1:
-                        add_query_log("[ANSWER CHECK]        ✗ Initial answer insufficient — web search added")
-                        add_query_log("[ANSWER CHECK]        ✓ Final answer addresses question")
-                    else:
-                        add_query_log("[ANSWER CHECK]        ✓ Answer addresses question")
-
-                    add_query_log("")
-                    add_query_log("✓ Pipeline complete.")
-
                     st.markdown("---")
                     st.markdown("**Answer:**")
                     st.markdown(result["generation"])
-
+ 
+                    # ── Sources ───────────────────────────────────
                     docs = result.get("documents", [])
                     if docs:
-                        seen, rag_sources, web_sources = set(), [], []
-
+                        seen = set()
+                        rag_sources, web_sources = [], []
                         for doc in docs:
-                            # RAG chunk sources — stored in metadata["source"] by loaders
                             src = doc.metadata.get("source", "")
                             if src and src not in seen:
                                 seen.add(src)
                                 rag_sources.append(src)
-
-                            # Web search sources — stored in metadata["sources"] by web_search node
                             for s in doc.metadata.get("sources", []):
                                 if s and s not in seen:
                                     seen.add(s)
                                     web_sources.append(s)
-
                         if rag_sources or web_sources:
                             st.markdown("---")
                             st.markdown("**Sources consulted**")
@@ -635,7 +661,8 @@ with tab3:
                                 st.markdown("*From web search:*")
                                 for s in web_sources:
                                     st.markdown(f"- {s}")
-
+ 
+                    # ── LangSmith ─────────────────────────────────
                     try:
                         if run_id:
                             share_link = None
@@ -654,13 +681,11 @@ with tab3:
                                 st.caption("Trace syncing — check LangSmith dashboard.")
                     except Exception:
                         pass
-
+ 
                 else:
-                    add_query_log("[HALLUCINATION CHECK] ✗ Answer failed grounding check")
-                    add_query_log("[ANSWER CHECK]        ✗ Answer did not address question")
                     add_query_log("✗ Pipeline ended without valid answer.")
                     st.warning("No answer generated. Try rephrasing your question.")
-
+ 
             except Exception as e:
                 if "recursion" in str(e).lower():
                     add_query_log("✗ Pipeline exceeded max steps.")

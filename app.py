@@ -223,12 +223,8 @@ with tab2:
     if st.session_state.embed_api_calls > 0:
         st.caption(f"📊 Sessions: {st.session_state.embed_api_calls}/{MAX_SESSIONS} — {calls_left} remaining")
 
-    if st.session_state.append_mode:
-        st.info(f"➕ **Append mode** — Add new sources and click INGEST. "
-                f"Max {MAX_CHUNKS} chunks per session. Previously ingested docs are safe.")
-    else:
-        st.caption("Add URLs and/or upload local files, then click Ingest to build the knowledge base.")
-        st.caption(f"_A link has been preselected. Max {MAX_CHUNKS} chunks · {MAX_SESSIONS} ingestions per session._")
+    st.caption("Add URLs and/or upload local files, then click Ingest to build the knowledge base.")
+    st.caption(f"_A link has been preselected. Max {MAX_CHUNKS} chunks · {MAX_SESSIONS} ingestions per session._")
 
     st.markdown("---")
 
@@ -476,6 +472,9 @@ with tab2:
     if st.session_state.ingested:
         st.markdown("---")
         st.markdown("**🗄️ Manage Knowledge Base**")
+        if st.session_state.append_mode:
+            st.info(f"➕ **Append mode** — Add new sources above and click INGEST. "
+                    f"Max {MAX_CHUNKS} chunks per session. Previously ingested docs are safe.")
         ca, cb = st.columns(2)
         with ca:
             add_dis = st.session_state.embed_api_calls >= MAX_SESSIONS

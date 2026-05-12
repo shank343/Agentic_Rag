@@ -224,7 +224,7 @@ with tab2:
         st.caption(f"📊 Sessions: {st.session_state.embed_api_calls}/{MAX_SESSIONS} — {calls_left} remaining")
 
     st.caption("Add URLs and/or upload local files, then click Ingest to build the knowledge base.")
-    st.caption(f"_A link has been preselected. Max {MAX_CHUNKS} chunks · {MAX_SESSIONS} ingestions per session._")
+    st.caption(f"_A link has been preselected (you can click Ingest right away). Max {MAX_CHUNKS} chunks · {MAX_SESSIONS} ingestions per session._")
 
     st.markdown("---")
 

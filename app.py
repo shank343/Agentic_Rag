@@ -188,7 +188,7 @@ with tab1:
     with col2:
         st.markdown("""
         **🟠 Web Search**
-        Tavily fetches real-time web results (capped at 1,000 chars per result) when the
+        Tavily fetches real-time web results when the
         vectorstore cannot fully answer the question. Results are appended to relevant chunks.
 
         ---
